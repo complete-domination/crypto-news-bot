@@ -3,9 +3,10 @@ import re
 import html as ihtml
 import asyncio
 import logging
-from typing import Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set
 
 import aiohttp
+import feedparser
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -14,45 +15,58 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-# Tweakable knobs
+# Polling + output
 POLL_MINUTES = float(os.getenv("POLL_MINUTES", "2"))
 SYNOPSIS_MAX_CHARS = int(os.getenv("SYNOPSIS_MAX_CHARS", "900"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
-# Visibility during testing
+# Visibility / testing
 POST_ON_STARTUP = os.getenv("POST_ON_STARTUP", "false").lower() == "true"
 POST_STARTUP_MAX = int(os.getenv("POST_STARTUP_MAX", "1"))
 
-# Logging level
+# Filtering (leave KEYWORDS empty to get ALL crypto headlines)
+DEFAULT_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://cryptoslate.com/feed/",
+    "https://beincrypto.com/feed/",
+    "https://u.today/rss",
+    "https://ambcrypto.com/feed/",
+    "https://news.bitcoin.com/feed/",
+    # Optional broad aggregator (very active):
+    # "https://news.google.com/rss/search?q=crypto+OR+cryptocurrency+OR+bitcoin+OR+ethereum&hl=en-US&gl=US&ceid=US:en",
+]
+FEEDS = [f.strip() for f in os.getenv("FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if f.strip()]
+
+KEYWORDS = [k.strip() for k in os.getenv("KEYWORDS", "").split(",") if k.strip()]
+EXCLUDE_KEYWORDS = [k.strip() for k in os.getenv("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
+
+# Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("cryptopanic-bot")
+log = logging.getLogger("crypto-news-bot")
 
-if not DISCORD_TOKEN or not CRYPTOPANIC_TOKEN or CHANNEL_ID == 0:
-    raise SystemExit("Set DISCORD_TOKEN, CRYPTOPANIC_TOKEN, and CHANNEL_ID env vars.")
+if not DISCORD_TOKEN or CHANNEL_ID == 0:
+    raise SystemExit("Set DISCORD_TOKEN and CHANNEL_ID env vars.")
 
 # ---------------- Discord ----------------
 INTENTS = discord.Intents.default()
 client = discord.Client(intents=INTENTS)
 
-# De-dupe memory (this run)
+# De-dupe (in-memory for this run)
 SEEN_IDS: Set[str] = set()
 HAS_POSTED_ON_STARTUP = False
 
 
 # ---------------- Helpers ----------------
 def _strip_tags(html: str) -> str:
-    # remove scripts/styles
     html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
-    # replace line breaks
     html = re.sub(r"(?i)<br\s*/?>", "\n", html)
     html = re.sub(r"(?i)</p>", "\n", html)
-    # strip remaining tags
     text = re.sub(r"(?s)<.*?>", "", html)
-    # unescape & tidy
     text = ihtml.unescape(text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n\s*\n\s*", "\n\n", text).strip()
@@ -77,39 +91,50 @@ def _first_sentences(text: str, max_chars: int, max_sents: int = 6) -> str:
     return joined or text[:max_chars].rstrip()
 
 
+def _entry_id(entry: dict) -> str:
+    return (
+        entry.get("id")
+        or entry.get("guid")
+        or entry.get("link")
+        or f"{entry.get('title','')}-{entry.get('published','')}"
+        or os.urandom(8).hex()
+    )
+
+
+def _match_topic(text: str) -> bool:
+    if not KEYWORDS:  # empty = accept all
+        return True
+    t = text.lower()
+    if EXCLUDE_KEYWORDS and any(ex.lower() in t for ex in EXCLUDE_KEYWORDS):
+        return False
+    return any(k.lower() in t for k in KEYWORDS)
+
+
 async def _http_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch text with graceful handling of 404/other errors."""
+    """Fetch text; gracefully skip 404 or other non-200s."""
     if not url:
         return None
     try:
         async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status == 404:
-                # Skip this site/page (common request)
-                log.warning("Synopsis skip (404): %s", url)
+                log.warning("Page 404, skipping: %s", url)
                 return None
             if resp.status != 200:
-                log.warning("Synopsis fetch HTTP %s for %s", resp.status, url)
+                log.warning("Page HTTP %s for %s", resp.status, url)
                 return None
             return await resp.text()
     except Exception as e:
-        log.warning("Synopsis fetch error for %s: %s", url, e)
+        log.warning("Page fetch error for %s: %s", url, e)
         return None
 
 
-async def _long_synopsis(session: aiohttp.ClientSession, article_url: str, fallback_title: str,
-                         rss_like_summary: Optional[str]) -> str:
-    """
-    Longer synopsis:
-      1) start with any provided summary (CryptoPanic rarely includes one)
-      2) add meta description (og/twitter/description) from the article
-      3) add first paragraphs from <article>/<p> content
-      4) trim to SYNOPSIS_MAX_CHARS
-    """
-    pieces = []
-    if rss_like_summary:
-        pieces.append(_strip_tags(rss_like_summary).strip())
+async def get_long_synopsis(session: aiohttp.ClientSession, url: str, fallback: str, rss_summary: Optional[str]) -> str:
+    """Long synopsis = RSS summary + meta description + first paragraphs."""
+    pieces: List[str] = []
+    if rss_summary:
+        pieces.append(_strip_tags(rss_summary).strip())
 
-    html = await _http_text(session, article_url)
+    html = await _http_text(session, url)
     if html:
         def grab(content: str, needle: str) -> Optional[str]:
             c_low = content.lower()
@@ -132,7 +157,6 @@ async def _long_synopsis(session: aiohttp.ClientSession, article_url: str, fallb
         if meta:
             pieces.append(meta.strip())
 
-        # Prefer content inside <article>, fallback to entire page
         article_match = re.search(r"(?is)<article[^>]*>(.*?)</article>", html)
         body_html = article_match.group(1) if article_match else html
         paragraphs = re.findall(r"(?is)<p[^>]*>(.*?)</p>", body_html)
@@ -140,52 +164,77 @@ async def _long_synopsis(session: aiohttp.ClientSession, article_url: str, fallb
         if body_text:
             pieces.append(_first_sentences(body_text, SYNOPSIS_MAX_CHARS * 2, max_sents=6))
 
-    combo = " ".join([p for p in pieces if p]).strip() or fallback_title
-    if len(combo) > SYNOPSIS_MAX_CHARS:
-        combo = combo[:SYNOPSIS_MAX_CHARS].rstrip() + "…"
-    return combo
+    synopsis = " ".join([p for p in pieces if p]).strip() or fallback
+    if len(synopsis) > SYNOPSIS_MAX_CHARS:
+        synopsis = synopsis[:SYNOPSIS_MAX_CHARS].rstrip() + "…"
+    return synopsis
 
 
-# ---------------- CryptoPanic API ----------------
-async def fetch_latest_post(session: aiohttp.ClientSession) -> Optional[dict]:
-    """
-    Fetch newest CryptoPanic news post.
-    Docs: https://cryptopanic.com/developers/api/
-    """
-    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_TOKEN}&public=true&kind=news"
+# ---------------- Feeds ----------------
+async def parse_feed(session: aiohttp.ClientSession, feed_url: str) -> List[Dict]:
+    out: List[Dict] = []
     try:
-        async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
+        async with session.get(feed_url, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status == 404:
+                log.warning("Removing dead feed (404): %s", feed_url)
+                return out
             if resp.status != 200:
-                log.warning("CryptoPanic HTTP %s", resp.status)
-                return None
-            data = await resp.json()
+                log.warning("Feed HTTP %s: %s", resp.status, feed_url)
+                return out
+            content = await resp.read()
     except Exception as e:
-        log.warning("CryptoPanic fetch error: %s", e)
-        return None
+        log.warning("Feed error %s: %s", feed_url, e)
+        return out
 
-    results = data.get("results", [])
-    if not results:
-        return None
-    # Newest-first; take the first
-    return results[0]
+    parsed = feedparser.parse(content)
+    for entry in parsed.entries:
+        title = entry.get("title", "")
+        summary = entry.get("summary", "") or entry.get("description", "")
+        link = entry.get("link", "")
+        combined = " ".join([title, summary or "", link or ""])
+        if not _match_topic(combined):
+            continue
+
+        item = {
+            "id": _entry_id(entry),
+            "title": title or "New article",
+            "summary": summary,
+            "link": link or "",
+            "published": entry.get("published", "") or entry.get("updated", ""),
+            "source": parsed.feed.get("title", "") if parsed.feed else "",
+        }
+        out.append(item)
+    return out
 
 
-async def build_message(post: dict, session: aiohttp.ClientSession) -> Tuple[str, Optional[discord.Embed]]:
-    title = post.get("title") or post.get("slug") or "New post"
-    url = post.get("url") or (post.get("source") or {}).get("url") or "https://cryptopanic.com/"
-    published_at = post.get("published_at", "")
-    source = (post.get("source") or {}).get("domain", "Source")
-    votes = post.get("votes") or {}
-    bullish = votes.get("positive", 0)
-    bearish = votes.get("negative", 0)
+async def poll_all_feeds(session: aiohttp.ClientSession) -> List[Dict]:
+    tasks = [parse_feed(session, url) for url in FEEDS]
+    results: List[List[Dict]] = await asyncio.gather(*tasks, return_exceptions=True)
+    items: List[Dict] = []
+    for res in results:
+        if isinstance(res, list):
+            items.extend(res)
+    # Sort newest first when possible
+    def _key(x: Dict):
+        return x.get("published") or ""
+    items.sort(key=_key, reverse=True)
+    return items
 
-    # CryptoPanic usually doesn't supply a full text summary; pass None
-    synopsis = await _long_synopsis(session, url, fallback_title=title, rss_like_summary=None)
+
+async def build_message(item: Dict, session: aiohttp.ClientSession) -> Tuple[str, Optional[discord.Embed]]:
+    title = item.get("title") or "New article"
+    url = item.get("link") or ""
+    source = item.get("source") or "Source"
+    published = item.get("published") or ""
+    rss_summary = item.get("summary")
+
+    synopsis = await get_long_synopsis(session, url, fallback=title, rss_summary=rss_summary)
 
     text = f"**{title}**\n{url}\n\n**Synopsis:** {synopsis}"
     embed = discord.Embed(
-        title=f"{source} • {published_at}",
-        description=f"Sentiment votes — 👍 {bullish}  |  👎 {bearish}",
+        title=f"{source} • {published}",
+        description=("Filtering OFF (all crypto news)" if not KEYWORDS
+                     else f"Keywords: {', '.join(KEYWORDS)}"),
         url=url,
     )
     return text, embed
@@ -198,7 +247,7 @@ async def poll_and_post():
 
     await client.wait_until_ready()
 
-    # Channel lookup (cache-safe)
+    # Ensure the channel is available
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
         try:
@@ -210,34 +259,42 @@ async def poll_and_post():
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 5)
     connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        post = await fetch_latest_post(session)
-        if not post:
-            log.info("No results from CryptoPanic this cycle.")
+        items = await poll_all_feeds(session)
+        if not items:
+            log.info("No entries found this cycle.")
             return
 
-        pid = str(post.get("id") or "")
-        newest_title = (post.get("title") or "")[:80]
+        posted = 0
+        for item in items:
+            iid = item.get("id", "")
+            should_post = False
 
-        # Decide whether to post:
-        should_post = False
-        if POST_ON_STARTUP and not HAS_POSTED_ON_STARTUP:
-            should_post = True
-        elif pid and pid not in SEEN_IDS:
-            should_post = True
+            if POST_ON_STARTUP and not HAS_POSTED_ON_STARTUP:
+                should_post = True
+            elif iid and iid not in SEEN_IDS:
+                should_post = True
 
-        if not should_post:
-            log.info("No new posts to send this cycle. (latest: %s)", newest_title)
-            return
+            if not should_post:
+                continue
 
-        text, embed = await build_message(post, session)
-        try:
-            await channel.send(text, embed=embed)
-            if pid:
-                SEEN_IDS.add(pid)
-            HAS_POSTED_ON_STARTUP = True
-            log.info("Posted: %s", newest_title)
-        except Exception as e:
-            log.exception("Failed sending message: %s", e)
+            text, embed = await build_message(item, session)
+            try:
+                await channel.send(text, embed=embed)
+                if iid:
+                    SEEN_IDS.add(iid)
+                posted += 1
+                HAS_POSTED_ON_STARTUP = True
+                log.info("Posted: %s | %s", item.get("source"), (item.get("title") or "")[:80])
+            except Exception as e:
+                log.exception("Failed sending message: %s", e)
+
+            if POST_ON_STARTUP and posted >= POST_STARTUP_MAX:
+                break
+
+        if posted == 0:
+            top = items[0]
+            log.info("No new posts this cycle. Latest seen: %s | %s",
+                     top.get("source"), (top.get("title") or "")[:80])
 
 
 @poll_and_post.before_loop
@@ -252,26 +309,27 @@ async def on_ready():
         poll_and_post.start()
 
 
-# Optional manual trigger in the target channel
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if message.channel.id != CHANNEL_ID:
         return
-    if message.content.strip().lower() == "!newsnow":
+    cmd = message.content.strip().lower()
+    if cmd == "!newsnow":
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 5)
         connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            post = await fetch_latest_post(session)
-            if not post:
-                await message.channel.send("Couldn’t fetch news right now.")
+            items = await poll_all_feeds(session)
+            if not items:
+                await message.channel.send("No crypto headlines found right now.")
                 return
-            pid = str(post.get("id") or "")
-            text, embed = await build_message(post, session)
+            # Prefer first not-seen; else newest
+            chosen = next((it for it in items if it.get("id") not in SEEN_IDS), items[0])
+            text, embed = await build_message(chosen, session)
             await message.channel.send(text, embed=embed)
-            if pid:
-                SEEN_IDS.add(pid)
+            if chosen.get("id"):
+                SEEN_IDS.add(chosen["id"])
 
 
 def main():
