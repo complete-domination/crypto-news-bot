@@ -6,3 +6,4 @@ readability-lxml>=0.8.1
 beautifulsoup4>=4.12.2
 lxml>=5.2.1
 aioredis>=2.0.1
+python-dotenv==1.0.1
