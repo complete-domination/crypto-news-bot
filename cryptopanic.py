@@ -5,6 +5,9 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import aiohttp
 import discord
@@ -29,15 +32,18 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])  # required
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "180"))
 POSTS_PER_INTERVAL = int(os.environ.get("POSTS_PER_INTERVAL", "3"))
 
-# Optional Redis for dedupe persistence (leave empty to use in-memory only)
+# recency controls (from previous update)
+MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS", "12"))
+ALLOW_UNDATED = os.environ.get("ALLOW_UNDATED", "0") == "1"
+
+# optional Redis for cross-restart dedupe
 REDIS_URL = os.environ.get("REDIS_URL")
 
-# RSS feeds (add/remove freely)
+# RSS feeds
 RSS_FEEDS = [
-    # General crypto
     "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
     "https://decrypt.co/feed",
-    "https://www.theblock.co/rss",            # may rate-limit sometimes
+    "https://www.theblock.co/rss",
     "https://bitcoinmagazine.com/.rss/full/",
     "https://cryptoslate.com/feed/",
     "https://cointelegraph.com/rss",
@@ -54,11 +60,68 @@ log = logging.getLogger("crypto-news-rss-bot")
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
+# ---------------- Dedupe helpers ----------------
+_TRACKING_PARAMS = {
+    "utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_name","utm_id",
+    "gclid","fbclid","mc_cid","mc_eid","ref","ref_src","feature","spm","igshid","ito","s",
+}
+
+def normalize_url(url: str) -> str:
+    """Normalize URL to improve dedupe across feeds."""
+    try:
+        p = urlparse(url)
+        # lowercase scheme/host
+        scheme = (p.scheme or "https").lower()
+        netloc = (p.netloc or "").lower()
+        path = p.path or ""
+        # remove trailing /amp or /amp/
+        if path.endswith("/amp/"):
+            path = path[:-5]
+        elif path.endswith("/amp"):
+            path = path[:-4]
+        # clean query: drop tracking params, sort others
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k not in _TRACKING_PARAMS]
+        q.sort()
+        query = urlencode(q)
+        # strip fragments
+        frag = ""
+        new = urlunparse((scheme, netloc, path, p.params, query, frag))
+        return new
+    except Exception:
+        return url
+
+def title_fingerprint(title: str) -> str:
+    """Rough fingerprint for title-based dedupe."""
+    t = title.lower()
+    t = re.sub(r"[^a-z0-9\s$%\-]", " ", t)
+    words = [w for w in t.split() if len(w) > 2 and w not in {
+        "the","and","for","from","with","that","this","are","was","were","has","have","into",
+        "amid","over","under","after","before","among","about","its","their","your","our",
+        "says","said","new","news","crypto","cryptocurrency"
+    }]
+    # keep order-agnostic signature
+    return " ".join(sorted(set(words)))[:220]
+
+def titles_similar(fp1: str, fp2: str) -> bool:
+    s1, s2 = set(fp1.split()), set(fp2.split())
+    if not s1 or not s2:
+        return False
+    jacc = len(s1 & s2) / len(s1 | s2)
+    return jacc >= 0.85
+
 # ---------------- Persistence (optional Redis) ----------------
 class DedupeStore:
+    """
+    Stores:
+      - normalized URLs
+      - canonical URLs
+      - title fingerprints (rolling)
+    """
     def __init__(self):
-        self.memory = set()
+        self.url_set = set()
+        self.title_fps: List[str] = []
         self.redis = None
+        self.TITLE_MAX = 400  # rolling window
 
     async def setup(self):
         if REDIS_URL:
@@ -71,19 +134,49 @@ class DedupeStore:
                 log.warning(f"Redis unavailable ({e}); falling back to memory.")
                 self.redis = None
 
-    async def _key(self) -> str:
-        return "crypto_news_bot.posted_urls"
+    async def _k_urls(self) -> str:
+        return "crypto_news_bot.urls"
 
-    async def has(self, url: str) -> bool:
-        if self.redis:
-            return await self.redis.sismember(await self._key(), url)
-        return url in self.memory
+    async def _k_titles(self) -> str:
+        return "crypto_news_bot.title_fps"
 
-    async def add(self, url: str):
+    async def has_url(self, url: str) -> bool:
+        url = normalize_url(url)
         if self.redis:
-            await self.redis.sadd(await self._key(), url)
+            return await self.redis.sismember(await self._k_urls(), url)
+        return url in self.url_set
+
+    async def add_url(self, url: str):
+        url = normalize_url(url)
+        if self.redis:
+            await self.redis.sadd(await self._k_urls(), url)
         else:
-            self.memory.add(url)
+            self.url_set.add(url)
+
+    async def has_title_like(self, fp: str) -> bool:
+        if self.redis:
+            # check exact first
+            if await self.redis.sismember(await self._k_titles(), fp):
+                return True
+            # fetch a manageable sample to compare similarity
+            existing = await self.redis.smembers(await self._k_titles())
+        else:
+            existing = list(self.title_fps)
+
+        # near-duplicate check
+        for e in existing[-self.TITLE_MAX:]:
+            if e == fp or titles_similar(e, fp):
+                return True
+        return False
+
+    async def add_title(self, fp: str):
+        if self.redis:
+            await self.redis.sadd(await self._k_titles(), fp)
+            # (optional) trim with a separate structure if you want strict bounds
+        else:
+            self.title_fps.append(fp)
+            if len(self.title_fps) > self.TITLE_MAX:
+                self.title_fps = self.title_fps[-self.TITLE_MAX:]
 
 store = DedupeStore()
 
@@ -99,22 +192,56 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, timeout: int = 25
             async with session.get(url, timeout=timeout) as r:
                 r.raise_for_status()
                 return await r.text()
-        except Exception as e:
+        except Exception:
             if attempt == 2:
                 raise
             await asyncio.sleep(1.2 * (attempt + 1))
     return ""
 
+# ---------------- Date parsing ----------------
+def parse_dt(entry: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("published_parsed", "updated_parsed"):
+        if entry.get(key):
+            try:
+                return datetime.fromtimestamp(int(feedparser.mktime_tz(entry[key])), tz=timezone.utc)
+            except Exception:
+                pass
+    for key in ("published", "updated"):
+        val = entry.get(key)
+        if not val:
+            continue
+        try:
+            dt = parsedate_to_datetime(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except Exception:
+            continue
+    return None
+
+# ---------------- RSS fetch ----------------
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> List[Dict[str, Any]]:
     text = await fetch_text(session, url, timeout=20)
     parsed = feedparser.parse(text)
     items = []
-    for e in parsed.entries[:20]:
+    feed_title = parsed.feed.get("title", "")
+    for e in parsed.entries[:40]:
         link = e.get("link")
-        title = e.get("title", "").strip()
-        published = e.get("published", "") or e.get("updated", "")
-        if link and title:
-            items.append({"title": title, "link": link, "published": published, "source": parsed.feed.get("title", "")})
+        title = (e.get("title") or "").strip()
+        if not link or not title:
+            continue
+        dt = parse_dt(e)
+        items.append({
+            "title": title,
+            "link": link,
+            "norm_link": normalize_url(link),
+            "published": e.get("published") or e.get("updated") or "",
+            "source": feed_title,
+            "dt": dt,
+            "title_fp": title_fingerprint(title),
+        })
     return items
 
 # ---------------- Extraction & Summary ----------------
@@ -127,8 +254,7 @@ def split_sentences(text: str) -> List[str]:
     text = clean_text(text)
     text = re.sub(r"(Mr|Ms|Dr|Prof|Jr|Sr|St)\.", r"\1<dot>", text)
     parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(“\"'])", text)
-    parts = [p.replace("<dot>", ".").strip() for p in parts if p.strip()]
-    return parts
+    return [p.replace("<dot>", ".").strip() for p in parts if p.strip()]
 
 def summarize(text: str, max_sentences: int = 3, max_chars: int = 420) -> str:
     sents = split_sentences(text)
@@ -162,13 +288,8 @@ def summarize(text: str, max_sentences: int = 3, max_chars: int = 420) -> str:
 
     ranked = sorted(((i, s, score(s, i)) for i, s in enumerate(sents)), key=lambda x: x[2], reverse=True)
     chosen: List[Tuple[int, str]] = []
-    seen_idx = set()
-    for i, s, _ in ranked:
-        if len(chosen) >= max_sentences:
-            break
+    for i, s, _ in ranked[:max_sentences]:
         chosen.append((i, s))
-        seen_idx.add(i)
-
     chosen.sort(key=lambda x: x[0])
     out = " ".join(s for _, s in chosen)
     if len(out) > max_chars:
@@ -183,6 +304,21 @@ def dedupe_headline(title: str, synopsis: str) -> str:
     if t and t in s:
         synopsis = re.sub(re.escape(title) + r"[:\-–]?\s*", "", synopsis, flags=re.IGNORECASE).strip()
     return synopsis
+
+def extract_canonical(html: str) -> Optional[str]:
+    if not BeautifulSoup:
+        return None
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for sel in ["link[rel=canonical]", "meta[property='og:url']"]:
+            tag = soup.select_one(sel)
+            if tag:
+                u = tag.get("href") or tag.get("content")
+                if u and u.startswith("http"):
+                    return normalize_url(u)
+    except Exception:
+        pass
+    return None
 
 def extract_with_trafilatura(url: str, html: Optional[str] = None) -> Optional[str]:
     if not trafilatura:
@@ -228,24 +364,20 @@ def meta_description(html: str) -> Optional[str]:
         pass
     return None
 
-async def build_synopsis(session: aiohttp.ClientSession, url: str, title: str) -> str:
+async def build_synopsis_and_canonical(session: aiohttp.ClientSession, url: str, title: str) -> Tuple[str, Optional[str]]:
+    """Fetch page once; return (synopsis, canonical_url_if_any)."""
     try:
         html = await fetch_text(session, url)
     except Exception as e:
         log.warning(f"Fetch article failed: {e}")
-        return ""
-    text = None
-    if trafilatura:
-        text = extract_with_trafilatura(url, html)
+        return "", None
+    canonical = extract_canonical(html)
+    text = extract_with_trafilatura(url, html) or extract_with_readability(html) or meta_description(html)
     if not text:
-        text = extract_with_readability(html)
-    if not text:
-        text = meta_description(html)
-    if not text:
-        return ""
+        return "", canonical
     text = re.sub(r"(©|Copyright).*?\d{4}.*", "", text, flags=re.IGNORECASE)
     synopsis = summarize(text, max_sentences=3, max_chars=420)
-    return dedupe_headline(title, synopsis)
+    return dedupe_headline(title, synopsis), canonical
 
 # ---------------- Posting ----------------
 async def post_embed(channel: discord.TextChannel, item: Dict[str, Any], synopsis: str):
@@ -253,7 +385,6 @@ async def post_embed(channel: discord.TextChannel, item: Dict[str, Any], synopsi
     link = item["link"]
     published = item.get("published") or "unknown time"
     source_name = item.get("source") or ""
-
     description = f"**Synopsis:** {synopsis}" if synopsis else "_Synopsis unavailable_"
     embed = discord.Embed(title=title, url=link, description=description, color=0x2b6cb0)
     small_source = f"{source_name} • `{published}`" if source_name else f"`{published}`"
@@ -273,32 +404,56 @@ async def on_ready():
     while True:
         try:
             async with get_session() as session:
-                # Collect fresh items across feeds
-                all_items: List[Dict[str, Any]] = []
+                # Gather
+                items: List[Dict[str, Any]] = []
                 for feed_url in RSS_FEEDS:
                     try:
-                        items = await fetch_rss(session, feed_url)
-                        all_items.extend(items)
+                        items.extend(await fetch_rss(session, feed_url))
                     except Exception as e:
                         log.warning(f"RSS fetch failed for {feed_url}: {e}")
 
-                # sort by "newest-looking" first (published string desc)
-                all_items = [
-                    x for x in all_items
-                    if isinstance(x.get("link"), str) and x.get("title")
-                ]
-                # naive sort: newest entries often appear first already; keep order
+                # Recency filter + newest first
+                now = datetime.now(timezone.utc)
+                cutoff = now - timedelta(hours=MAX_AGE_HOURS)
+                fresh = []
+                for it in items:
+                    dt = it.get("dt")
+                    if dt is None and not ALLOW_UNDATED:
+                        continue
+                    if dt is not None and dt < cutoff:
+                        continue
+                    fresh.append(it)
+
+                fresh.sort(key=lambda x: x.get("dt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
                 posted = 0
-                for item in all_items:
+                for item in fresh:
                     if posted >= POSTS_PER_INTERVAL:
                         break
-                    link = item["link"]
-                    if await store.has(link):
+
+                    link_norm = item["norm_link"]
+                    # quick URL dedupe
+                    if await store.has_url(link_norm):
                         continue
-                    synopsis = await build_synopsis(session, link, item["title"])
+                    # quick title dedupe
+                    if await store.has_title_like(item["title_fp"]):
+                        continue
+
+                    # fetch article once to (a) extract body (b) get canonical URL
+                    synopsis, canonical = await build_synopsis_and_canonical(session, item["link"], item["title"])
+
+                    # canonical/url dedupe before posting
+                    if canonical and await store.has_url(canonical):
+                        continue
+
                     await post_embed(channel, item, synopsis)
-                    await store.add(link)
+
+                    # record dedupe keys
+                    await store.add_url(link_norm)
+                    if canonical:
+                        await store.add_url(canonical)
+                    await store.add_title(item["title_fp"])
+
                     posted += 1
 
                 if posted == 0:
