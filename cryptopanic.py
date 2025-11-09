@@ -1,213 +1,303 @@
 # cryptopanic.py
 import os
+import re
+import time
+import json
+import math
+import asyncio
 import logging
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+from typing import Optional, Tuple, Dict, Any, List
 
 import aiohttp
 import discord
-from discord.ext import tasks
-from dotenv import load_dotenv
 
-# -------- Env / Config --------
-load_dotenv()  # for local dev; Railway uses Variables UI
+# Optional extractors (pure Python)
+try:
+    import trafilatura  # best extractor
+except Exception:
+    trafilatura = None
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-POLL_MINUTES = float(os.getenv("POLL_MINUTES", "2"))  # adjust cadence in env
+try:
+    from readability import Document  # fallback extractor
+    from bs4 import BeautifulSoup
+except Exception:
+    Document = None
+    BeautifulSoup = None
 
-if not DISCORD_TOKEN or not CRYPTOPANIC_TOKEN or CHANNEL_ID == 0:
-    raise SystemExit("Set DISCORD_TOKEN, CRYPTOPANIC_TOKEN and CHANNEL_ID env vars.")
+# -------- Config --------
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or os.environ.get("TOKEN")
+CHANNEL_ID = int(os.environ["CHANNEL_ID"])  # required
+CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN")  # optional
+INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "90"))
 
-# -------- Logging (shows in Railway logs) --------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+if not DISCORD_TOKEN:
+    raise SystemExit("Missing env var DISCORD_TOKEN")
+if not CHANNEL_ID:
+    raise SystemExit("Missing env var CHANNEL_ID")
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("cryptopanic-bot")
 
-# -------- Discord client --------
-INTENTS = discord.Intents.default()  # no privileged intents needed to post
-client = discord.Client(intents=INTENTS)
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
 
-# Dedupe memory (simple, in-process)
-LAST_SEEN_ID: Optional[str] = None
-LAST_SEEN_TITLE: Optional[str] = None
+# memory to prevent repeats
+last_seen_id: Optional[str] = None
+last_synopsis: Optional[str] = None
 
+# -------- Utilities --------
+def clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip()
+    # drop trailing site boilerplate if obvious
+    t = re.sub(r"Read more.*$", "", t, flags=re.IGNORECASE)
+    return t
 
-async def fetch_latest_post(session: aiohttp.ClientSession) -> Optional[dict]:
+def split_sentences(text: str) -> List[str]:
+    # lightweight sentence splitter
+    text = clean_text(text)
+    # protect abbreviations
+    text = re.sub(r"(Mr|Ms|Dr|Prof|Jr|Sr|St)\.", r"\1<dot>", text)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(“\"'])", text)
+    parts = [p.replace("<dot>", ".").strip() for p in parts if p.strip()]
+    return parts
+
+def summarize(text: str, max_sentences: int = 3, max_chars: int = 420) -> str:
     """
-    Get the newest CryptoPanic post (news only, public).
+    Simple frequency-based extractive summary that prefers:
+    - lead sentence
+    - high keyword density sentences
     """
-    url = (
-        f"https://cryptopanic.com/api/v1/posts/"
-        f"?auth_token={CRYPTOPANIC_TOKEN}&public=true&kind=news"
+    sentences = split_sentences(text)
+    if not sentences:
+        return ""
+
+    # if it's already short, return as-is
+    joined = " ".join(sentences)
+    if len(joined) <= max_chars and len(sentences) <= max_sentences:
+        return joined
+
+    # build a word freq table (lowercase, no tiny words)
+    words = re.findall(r"[A-Za-z0-9$%\-\.]+", text.lower())
+    stop = set(
+        "the a an and or of to for from in on at as with by is are was were be has have had "
+        "it that this those these you your their our its they he she them we not will would can "
+        "could should may might about into over under after before amid among than".split()
     )
+    freqs: Dict[str, int] = {}
+    for w in words:
+        if len(w) < 3 or w in stop:
+            continue
+        freqs[w] = freqs.get(w, 0) + 1
+
+    def score(s: str, i: int) -> float:
+        tokens = re.findall(r"[A-Za-z0-9$%\-\.]+", s.lower())
+        if not tokens:
+            return 0.0
+        dens = sum(freqs.get(t, 0) for t in tokens) / max(len(tokens), 1)
+        lead_bonus = 1.0 / (1 + i)  # prefer early sentences
+        length_penalty = 1.0 if len(s) < 240 else 0.85
+        return dens * 0.7 + lead_bonus * 0.25 + length_penalty * 0.05
+
+    # rank sentences
+    ranked = sorted(
+        [(i, s, score(s, i)) for i, s in enumerate(sentences)],
+        key=lambda x: x[2],
+        reverse=True,
+    )
+
+    chosen = []
+    used_idx = set()
+    for i, s, _ in ranked:
+        if len(chosen) >= max_sentences:
+            break
+        # discourage sentences next to each other to add variety
+        if any(abs(i - j) <= 0 for j in used_idx):
+            # allow adjacency if we don't have enough content
+            pass
+        chosen.append((i, s))
+        used_idx.add(i)
+
+    chosen.sort(key=lambda x: x[0])
+    out = " ".join(s for _, s in chosen)
+    # trim down if too long
+    if len(out) > max_chars:
+        out = out[: max_chars - 1].rsplit(" ", 1)[0] + "…"
+    return out
+
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=20) as r:
+                r.raise_for_status()
+                return await r.json()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1.5 * (attempt + 1))
+    return {}
+
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+    for attempt in range(3):
+        try:
+            async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=25) as r:
+                r.raise_for_status()
+                return await r.text()
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1.5 * (attempt + 1))
+    return ""
+
+def meta_description(html: str) -> Optional[str]:
+    if not BeautifulSoup:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    for key in ["meta[name=description]", "meta[property='og:description']",
+                "meta[name='twitter:description']"]:
+        tag = soup.select_one(key)
+        if tag and tag.get("content"):
+            return clean_text(tag["content"])
+    # fall back to first paragraph
+    p = soup.find("p")
+    if p and p.text:
+        return clean_text(p.text)
+    return None
+
+def extract_with_readability(html: str) -> Optional[str]:
+    if not Document or not BeautifulSoup:
+        return None
     try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                log.warning("CryptoPanic HTTP %s", resp.status)
-                return None
-            data = await resp.json()
-            results = data.get("results", [])
-            return results[0] if results else None
-    except Exception as e:
-        log.exception("Error fetching latest post: %s", e)
+        doc = Document(html)
+        summary_html = doc.summary()
+        soup = BeautifulSoup(summary_html, "lxml")
+        text = " ".join(x.get_text(" ", strip=True) for x in soup.find_all(["p", "li"]))
+        return clean_text(text)
+    except Exception:
         return None
 
-
-def pick_best_url(post: dict) -> str:
-    """
-    Prefer the original article URL. Fall back sensibly.
-    """
-    post_id = str(post.get("id", "")) if post else ""
-    return (
-        (post or {}).get("news_url")                           # sometimes present
-        or (post or {}).get("url")                             # sometimes present
-        or ((post or {}).get("source") or {}).get("url")       # often present here
-        or (f"https://cryptopanic.com/post/{post_id}/" if post_id else "https://cryptopanic.com/")
-    )
-
-
-async def try_get_synopsis(session: aiohttp.ClientSession, article_url: str, fallback_title: str) -> str:
-    """
-    Pull a short synopsis from common meta tags.
-    Avoid scraping cryptopanic.com (generic description causes dupes).
-    """
+def extract_with_trafilatura(url: str, html: Optional[str] = None) -> Optional[str]:
+    if not trafilatura:
+        return None
     try:
-        host = urlparse(article_url).hostname or ""
+        downloaded = html if html else trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+        return clean_text(text or "")
     except Exception:
-        host = ""
+        return None
 
-    # If we only have a CryptoPanic link, use a clean fallback.
-    if "cryptopanic.com" in host:
-        return fallback_title
+async def get_latest_post(session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+    base = "https://cryptopanic.com/api/posts/"
+    params = {"public": "true", "kind": "news", "regions": "en"}
+    if CRYPTOPANIC_TOKEN:
+        params["auth_token"] = CRYPTOPANIC_TOKEN
+    data = await fetch_json(session, base, params)
+    results = data.get("results") or []
+    return results[0] if results else None
 
+async def build_synopsis(session: aiohttp.ClientSession, url: str) -> str:
+    # fetch html
     try:
-        async with session.get(article_url, timeout=20) as resp:
-            if resp.status != 200:
-                return fallback_title
-            html = await resp.text()
-    except Exception:
-        return fallback_title
+        html = await fetch_text(session, url)
+    except Exception as e:
+        log.warning(f"Failed to fetch source page: {e}")
+        return ""
 
-    def _grab(content: str, needle: str) -> Optional[str]:
-        c_low = content.lower()
-        i = c_low.find(needle)
-        if i == -1:
-            return None
-        j = c_low.find('content="', i)
-        if j == -1:
-            return None
-        j += len('content="')
-        k = content.find('"', j)
-        if k == -1:
-            return None
-        return content[j:k].strip()
+    # try extractors
+    text = None
+    if trafilatura:
+        text = extract_with_trafilatura(url, html)
+    if not text:
+        text = extract_with_readability(html)
+    if not text:
+        text = meta_description(html)
 
-    og = _grab(html, 'property="og:description"')
-    tw = _grab(html, 'name="twitter:description"')
-    md = _grab(html, 'name="description"')
+    if not text:
+        return ""
 
-    summary = og or tw or md or fallback_title
-    return (summary[:297].rstrip() + "...") if len(summary) > 300 else summary
+    # clean and summarize
+    text = re.sub(r"(©|Copyright).*?\d{4}.*", "", text, flags=re.IGNORECASE)
+    text = clean_text(text)
+    return summarize(text, max_sentences=3, max_chars=420)
 
+def dedupe_synopsis(title: str, synopsis: str) -> str:
+    """Avoid just repeating the headline."""
+    if not synopsis:
+        return ""
+    t = re.sub(r"[^A-Za-z0-9 ]+", "", title.lower())
+    s = re.sub(r"[^A-Za-z0-9 ]+", "", synopsis.lower())
+    if t and t in s:
+        # remove leading headline-like fragment
+        s = re.sub(re.escape(title) + r"[:\-–]?\s*", "", synopsis, flags=re.IGNORECASE)
+        s = s.strip()
+    return s or synopsis
 
-async def build_message(post: dict, session: aiohttp.ClientSession) -> Tuple[str, Optional[discord.Embed]]:
-    """
-    Build the Discord message + embed.
-    """
-    title = post.get("title") or post.get("slug") or "New post"
-    url = pick_best_url(post)
-    published_at = post.get("published_at", "")
-    domain = (post.get("source") or {}).get("domain", "Source")
+async def post_update(channel: discord.TextChannel, post: Dict[str, Any], synopsis: str):
+    global last_synopsis
+    title = post.get("title") or "Crypto News"
+    link = post.get("url") or (post.get("source") or {}).get("url")
     votes = post.get("votes") or {}
-    bullish = votes.get("positive", 0)
-    bearish = votes.get("negative", 0)
+    positive = votes.get("positive", 0)
+    negative = votes.get("negative", 0)
+    published_at = post.get("published_at") or post.get("created_at") or "unknown time"
 
-    synopsis = await try_get_synopsis(session, url, fallback_title=title)
+    # avoid duplicate synopsis lines
+    if synopsis and last_synopsis and synopsis.strip() == last_synopsis.strip():
+        synopsis = ""
 
-    text = f"**{title}**\n{url}\n\n**Synopsis:** {synopsis}"
     embed = discord.Embed(
-        title=f"{domain} • {published_at}",
-        description=f"Sentiment votes — 👍 {bullish}  |  👎 {bearish}",
-        url=url,
+        title=title,
+        url=link or discord.Embed.Empty,
+        description=(f"**Synopsis:** {synopsis}" if synopsis else "_Synopsis unavailable_"),
+        color=0x2b6cb0,
     )
-    return text, embed
+    if link:
+        embed.add_field(name="Source", value=f"[Open]({link}) • `{published_at}`", inline=False)
+    embed.set_footer(text=f"Sentiment votes — 👍 {positive} | 👎 {negative}")
 
-
-@tasks.loop(minutes=POLL_MINUTES, reconnect=True)
-async def poll_and_post():
-    """
-    Periodically fetch and post latest item. Dedupe on id/title.
-    """
-    global LAST_SEEN_ID, LAST_SEEN_TITLE
-
-    await client.wait_until_ready()
-    channel = client.get_channel(CHANNEL_ID)
-    if channel is None:
-        log.error("Channel %s not found. Invite the bot and check permissions.", CHANNEL_ID)
-        return
-
-    timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        post = await fetch_latest_post(session)
-        if not post:
-            return
-
-        post_id = str(post.get("id", ""))
-        post_title = post.get("title") or ""
-
-        if (post_id and post_id == LAST_SEEN_ID) or (post_title and post_title == LAST_SEEN_TITLE):
-            return  # no reposts
-
-        text, embed = await build_message(post, session)
-        try:
-            await channel.send(text, embed=embed)
-            LAST_SEEN_ID = post_id or LAST_SEEN_ID
-            LAST_SEEN_TITLE = post_title or LAST_SEEN_TITLE
-            log.info("Posted %s | %s", post_id, post_title[:60])
-        except Exception as e:
-            log.exception("Failed sending message: %s", e)
-
-
-@poll_and_post.before_loop
-async def before_poll():
-    await client.wait_until_ready()
-
+    await channel.send(embed=embed)
+    if synopsis:
+        last_synopsis = synopsis
 
 @client.event
 async def on_ready():
-    log.info("Logged in as %s (%s)", client.user, client.user.id)
-    if not poll_and_post.is_running():
-        poll_and_post.start()
+    log.info(f"Logged in as {client.user} (id={client.user.id})")
+    channel = client.get_channel(CHANNEL_ID)
+    if not channel:
+        raise SystemExit(f"Channel {CHANNEL_ID} not found")
 
-
-# Optional manual trigger, locked to the one channel
-@client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.channel.id != CHANNEL_ID:
-        return  # ignore everywhere else
-    if message.content.strip().lower() == "!newsnow":
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            post = await fetch_latest_post(session)
-            if not post:
-                await message.channel.send("Couldn’t fetch news right now.")
-                return
-            text, embed = await build_message(post, session)
-            await message.channel.send(text, embed=embed)
-
-
-def main():
-    try:
-        # log_handler=None because we already configured logging above
-        client.run(DISCORD_TOKEN, log_handler=None)
-    except KeyboardInterrupt:
-        log.info("Shutting down.")
-
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                post = await get_latest_post(session)
+                if not post:
+                    log.info("No posts found.")
+                else:
+                    global last_seen_id
+                    post_id = str(post.get("id"))
+                    if post_id and post_id == last_seen_id:
+                        log.debug("No new post.")
+                    else:
+                        last_seen_id = post_id
+                        title = post.get("title", "")
+                        link = post.get("url") or (post.get("source") or {}).get("url")
+                        synopsis = ""
+                        if link:
+                            synopsis = await build_synopsis(session, link)
+                            synopsis = dedupe_synopsis(title, synopsis)
+                        await post_update(channel, post, synopsis)
+        except Exception as e:
+            log.exception(f"Loop error: {e}")
+        await asyncio.sleep(INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    client.run(DISCORD_TOKEN)
