@@ -1,39 +1,41 @@
+# cryptopanic.py
 import os
-import asyncio
 import logging
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-# ---- Env / Config ----
-load_dotenv()  # local dev; in Railway we use Variables UI instead
+# -------- Env / Config --------
+load_dotenv()  # for local dev; Railway uses Variables UI
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-POLL_MINUTES = float(os.getenv("POLL_MINUTES", "2"))  # you can tweak cadence in Railway vars
+POLL_MINUTES = float(os.getenv("POLL_MINUTES", "2"))  # adjust cadence in env
 
 if not DISCORD_TOKEN or not CRYPTOPANIC_TOKEN or CHANNEL_ID == 0:
-    raise SystemExit("Set DISCORD_TOKEN, CRYPTOPANIC_TOKEN and CHANNEL_ID as env vars.")
+    raise SystemExit("Set DISCORD_TOKEN, CRYPTOPANIC_TOKEN and CHANNEL_ID env vars.")
 
-# ---- Logging (Railway logs) ----
+# -------- Logging (shows in Railway logs) --------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("cryptopanic-bot")
 
-# ---- Discord client ----
-INTENTS = discord.Intents.default()  # no privileged intents required for posting
+# -------- Discord client --------
+INTENTS = discord.Intents.default()  # no privileged intents needed to post
 client = discord.Client(intents=INTENTS)
 
-LAST_SEEN_ID: Optional[str] = None  # simple dedupe
+# Dedupe memory (simple, in-process)
+LAST_SEEN_ID: Optional[str] = None
+LAST_SEEN_TITLE: Optional[str] = None
 
 
 async def fetch_latest_post(session: aiohttp.ClientSession) -> Optional[dict]:
     """
-    Get newest CryptoPanic post.
-    Narrow to public news (not discussions) for consistency.
+    Get the newest CryptoPanic post (news only, public).
     """
     url = (
         f"https://cryptopanic.com/api/v1/posts/"
@@ -52,11 +54,33 @@ async def fetch_latest_post(session: aiohttp.ClientSession) -> Optional[dict]:
         return None
 
 
+def pick_best_url(post: dict) -> str:
+    """
+    Prefer the original article URL. Fall back sensibly.
+    """
+    post_id = str(post.get("id", "")) if post else ""
+    return (
+        (post or {}).get("news_url")                           # sometimes present
+        or (post or {}).get("url")                             # sometimes present
+        or ((post or {}).get("source") or {}).get("url")       # often present here
+        or (f"https://cryptopanic.com/post/{post_id}/" if post_id else "https://cryptopanic.com/")
+    )
+
+
 async def try_get_synopsis(session: aiohttp.ClientSession, article_url: str, fallback_title: str) -> str:
     """
     Pull a short synopsis from common meta tags.
-    Keeps deps light (no bs4); robust enough for many sites.
+    Avoid scraping cryptopanic.com (generic description causes dupes).
     """
+    try:
+        host = urlparse(article_url).hostname or ""
+    except Exception:
+        host = ""
+
+    # If we only have a CryptoPanic link, use a clean fallback.
+    if "cryptopanic.com" in host:
+        return fallback_title
+
     try:
         async with session.get(article_url, timeout=20) as resp:
             if resp.status != 200:
@@ -88,8 +112,11 @@ async def try_get_synopsis(session: aiohttp.ClientSession, article_url: str, fal
 
 
 async def build_message(post: dict, session: aiohttp.ClientSession) -> Tuple[str, Optional[discord.Embed]]:
+    """
+    Build the Discord message + embed.
+    """
     title = post.get("title") or post.get("slug") or "New post"
-    url = post.get("url") or (post.get("source") or {}).get("url") or "https://cryptopanic.com/"
+    url = pick_best_url(post)
     published_at = post.get("published_at", "")
     domain = (post.get("source") or {}).get("domain", "Source")
     votes = post.get("votes") or {}
@@ -107,14 +134,17 @@ async def build_message(post: dict, session: aiohttp.ClientSession) -> Tuple[str
     return text, embed
 
 
-# ---- Poller (uses discord.ext.tasks, plays nice on Railway) ----
 @tasks.loop(minutes=POLL_MINUTES, reconnect=True)
 async def poll_and_post():
-    global LAST_SEEN_ID
+    """
+    Periodically fetch and post latest item. Dedupe on id/title.
+    """
+    global LAST_SEEN_ID, LAST_SEEN_TITLE
+
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
-        log.error("Channel %s not found. Is the bot in the server with correct perms?", CHANNEL_ID)
+        log.error("Channel %s not found. Invite the bot and check permissions.", CHANNEL_ID)
         return
 
     timeout = aiohttp.ClientTimeout(total=30)
@@ -125,14 +155,17 @@ async def poll_and_post():
             return
 
         post_id = str(post.get("id", ""))
-        if not post_id or post_id == LAST_SEEN_ID:
-            return
+        post_title = post.get("title") or ""
+
+        if (post_id and post_id == LAST_SEEN_ID) or (post_title and post_title == LAST_SEEN_TITLE):
+            return  # no reposts
 
         text, embed = await build_message(post, session)
         try:
             await channel.send(text, embed=embed)
-            LAST_SEEN_ID = post_id
-            log.info("Posted %s", post_id)
+            LAST_SEEN_ID = post_id or LAST_SEEN_ID
+            LAST_SEEN_TITLE = post_title or LAST_SEEN_TITLE
+            log.info("Posted %s | %s", post_id, post_title[:60])
         except Exception as e:
             log.exception("Failed sending message: %s", e)
 
@@ -149,11 +182,13 @@ async def on_ready():
         poll_and_post.start()
 
 
-# Optional manual trigger
+# Optional manual trigger, locked to the one channel
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    if message.channel.id != CHANNEL_ID:
+        return  # ignore everywhere else
     if message.content.strip().lower() == "!newsnow":
         timeout = aiohttp.ClientTimeout(total=30)
         connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
@@ -167,11 +202,11 @@ async def on_message(message: discord.Message):
 
 
 def main():
-    # Ensure clean shutdown handling on Railway
     try:
-        client.run(DISCORD_TOKEN, log_handler=None)  # we already configured logging
+        # log_handler=None because we already configured logging above
+        client.run(DISCORD_TOKEN, log_handler=None)
     except KeyboardInterrupt:
-        log.info("Shutting down (KeyboardInterrupt).")
+        log.info("Shutting down.")
 
 
 if __name__ == "__main__":
