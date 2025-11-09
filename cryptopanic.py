@@ -10,23 +10,30 @@ import feedparser
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import dateutil.parser
 
 # ---------------- Env / Config ----------------
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")            # required
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))        # required
 
 # Polling + output
 POLL_MINUTES = float(os.getenv("POLL_MINUTES", "2"))
 SYNOPSIS_MAX_CHARS = int(os.getenv("SYNOPSIS_MAX_CHARS", "900"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
+# Time filtering
+HOUR_WINDOW = int(os.getenv("HOUR_WINDOW", "1"))      # only post items within this many hours
+TIMEZONE = os.getenv("TIMEZONE", "UTC")               # e.g., "America/Chicago"
+
 # Visibility / testing
 POST_ON_STARTUP = os.getenv("POST_ON_STARTUP", "false").lower() == "true"
 POST_STARTUP_MAX = int(os.getenv("POST_STARTUP_MAX", "1"))
 
-# Filtering (leave KEYWORDS empty to get ALL crypto headlines)
+# Feeds & filters
 DEFAULT_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -36,11 +43,13 @@ DEFAULT_FEEDS = [
     "https://u.today/rss",
     "https://ambcrypto.com/feed/",
     "https://news.bitcoin.com/feed/",
-    # Optional broad aggregator (very active):
+    # Optional broad aggregator (very active). Uncomment to use:
     # "https://news.google.com/rss/search?q=crypto+OR+cryptocurrency+OR+bitcoin+OR+ethereum&hl=en-US&gl=US&ceid=US:en",
 ]
 FEEDS = [f.strip() for f in os.getenv("FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if f.strip()]
 
+# Leave KEYWORDS empty to accept ALL crypto headlines. Example to filter:
+# KEYWORDS="bitcoin, ethereum, solana"
 KEYWORDS = [k.strip() for k in os.getenv("KEYWORDS", "").split(",") if k.strip()]
 EXCLUDE_KEYWORDS = [k.strip() for k in os.getenv("EXCLUDE_KEYWORDS", "").split(",") if k.strip()]
 
@@ -108,6 +117,19 @@ def _match_topic(text: str) -> bool:
     if EXCLUDE_KEYWORDS and any(ex.lower() in t for ex in EXCLUDE_KEYWORDS):
         return False
     return any(k.lower() in t for k in KEYWORDS)
+
+
+def _parse_pubdate(pub_str: str, tz: ZoneInfo) -> Optional[datetime]:
+    if not pub_str:
+        return None
+    try:
+        dt = dateutil.parser.parse(pub_str)
+        if dt.tzinfo is None:
+            # Assume already in target tz if naive; treat as tz-aware in that zone
+            dt = dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+    except Exception:
+        return None
 
 
 async def _http_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
@@ -187,11 +209,14 @@ async def parse_feed(session: aiohttp.ClientSession, feed_url: str) -> List[Dict
         return out
 
     parsed = feedparser.parse(content)
+    feed_title = parsed.feed.get("title", "") if parsed.feed else ""
+
     for entry in parsed.entries:
-        title = entry.get("title", "")
-        summary = entry.get("summary", "") or entry.get("description", "")
-        link = entry.get("link", "")
-        combined = " ".join([title, summary or "", link or ""])
+        title = entry.get("title", "") or ""
+        summary = entry.get("summary", "") or entry.get("description", "") or ""
+        link = entry.get("link", "") or ""
+        combined = " ".join([title, summary, link])
+
         if not _match_topic(combined):
             continue
 
@@ -199,9 +224,9 @@ async def parse_feed(session: aiohttp.ClientSession, feed_url: str) -> List[Dict
             "id": _entry_id(entry),
             "title": title or "New article",
             "summary": summary,
-            "link": link or "",
+            "link": link,
             "published": entry.get("published", "") or entry.get("updated", ""),
-            "source": parsed.feed.get("title", "") if parsed.feed else "",
+            "source": feed_title,
         }
         out.append(item)
     return out
@@ -214,6 +239,7 @@ async def poll_all_feeds(session: aiohttp.ClientSession) -> List[Dict]:
     for res in results:
         if isinstance(res, list):
             items.extend(res)
+
     # Sort newest first when possible
     def _key(x: Dict):
         return x.get("published") or ""
@@ -231,10 +257,11 @@ async def build_message(item: Dict, session: aiohttp.ClientSession) -> Tuple[str
     synopsis = await get_long_synopsis(session, url, fallback=title, rss_summary=rss_summary)
 
     text = f"**{title}**\n{url}\n\n**Synopsis:** {synopsis}"
+    filter_desc = ("Filtering OFF (all crypto news)" if not KEYWORDS
+                   else f"Keywords: {', '.join(KEYWORDS)}")
     embed = discord.Embed(
         title=f"{source} • {published}",
-        description=("Filtering OFF (all crypto news)" if not KEYWORDS
-                     else f"Keywords: {', '.join(KEYWORDS)}"),
+        description=filter_desc,
         url=url,
     )
     return text, embed
@@ -243,6 +270,7 @@ async def build_message(item: Dict, session: aiohttp.ClientSession) -> Tuple[str
 # ---------------- Poller ----------------
 @tasks.loop(minutes=POLL_MINUTES, reconnect=True)
 async def poll_and_post():
+    """Poll feeds and only post items from *today* within the last HOUR_WINDOW hours (in TIMEZONE)."""
     global HAS_POSTED_ON_STARTUP
 
     await client.wait_until_ready()
@@ -256,6 +284,11 @@ async def poll_and_post():
             log.error("Cannot fetch channel %s: %s", CHANNEL_ID, e)
             return
 
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    cutoff = now - timedelta(hours=HOUR_WINDOW)
+    today = now.date()
+
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 5)
     connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -264,11 +297,27 @@ async def poll_and_post():
             log.info("No entries found this cycle.")
             return
 
-        posted = 0
-        for item in items:
-            iid = item.get("id", "")
-            should_post = False
+        # Apply time filter (today + within HOUR_WINDOW)
+        recent_items: List[Dict] = []
+        for it in items:
+            pub_dt = _parse_pubdate(it.get("published", ""), tz)
+            if not pub_dt:
+                continue
+            if pub_dt.date() != today:
+                continue
+            if pub_dt < cutoff:
+                continue
+            recent_items.append(it)
 
+        if not recent_items:
+            log.info("No posts from today within the last %d hour(s).", HOUR_WINDOW)
+            return
+
+        posted = 0
+        for item in recent_items:
+            iid = item.get("id", "")
+
+            should_post = False
             if POST_ON_STARTUP and not HAS_POSTED_ON_STARTUP:
                 should_post = True
             elif iid and iid not in SEEN_IDS:
@@ -284,7 +333,7 @@ async def poll_and_post():
                     SEEN_IDS.add(iid)
                 posted += 1
                 HAS_POSTED_ON_STARTUP = True
-                log.info("Posted: %s | %s", item.get("source"), (item.get("title") or "")[:80])
+                log.info("Posted (recent): %s | %s", item.get("source"), (item.get("title") or "")[:80])
             except Exception as e:
                 log.exception("Failed sending message: %s", e)
 
@@ -292,9 +341,10 @@ async def poll_and_post():
                 break
 
         if posted == 0:
-            top = items[0]
-            log.info("No new posts this cycle. Latest seen: %s | %s",
-                     top.get("source"), (top.get("title") or "")[:80])
+            # Useful diagnostics
+            newest = items[0]
+            log.info("No new eligible posts this cycle (time- or dedupe-filtered). Latest seen: %s | %s",
+                     newest.get("source"), (newest.get("title") or "")[:80])
 
 
 @poll_and_post.before_loop
@@ -317,15 +367,31 @@ async def on_message(message: discord.Message):
         return
     cmd = message.content.strip().lower()
     if cmd == "!newsnow":
+        tz = ZoneInfo(TIMEZONE)
+        now = datetime.now(tz)
+        cutoff = now - timedelta(hours=HOUR_WINDOW)
+        today = now.date()
+
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 5)
         connector = aiohttp.TCPConnector(limit=15, ttl_dns_cache=300)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             items = await poll_all_feeds(session)
-            if not items:
-                await message.channel.send("No crypto headlines found right now.")
+            # filter to current day/hour window for manual trigger too
+            recent = []
+            for it in items:
+                pub_dt = _parse_pubdate(it.get("published", ""), tz)
+                if not pub_dt:
+                    continue
+                if pub_dt.date() != today or pub_dt < cutoff:
+                    continue
+                recent.append(it)
+
+            if not recent:
+                await message.channel.send(f"No crypto headlines from the past {HOUR_WINDOW} hour(s).")
                 return
-            # Prefer first not-seen; else newest
-            chosen = next((it for it in items if it.get("id") not in SEEN_IDS), items[0])
+
+            # Prefer first not-seen; else newest recent
+            chosen = next((it for it in recent if it.get("id") not in SEEN_IDS), recent[0])
             text, embed = await build_message(chosen, session)
             await message.channel.send(text, embed=embed)
             if chosen.get("id"):
